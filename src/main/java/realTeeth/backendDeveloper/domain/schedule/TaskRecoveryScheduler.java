@@ -23,7 +23,7 @@ public class TaskRecoveryScheduler {
     @Transactional
     public void recovery() {
 
-        LocalDateTime localDateTime = LocalDateTime.now().plusMinutes(10);
+        LocalDateTime localDateTime = LocalDateTime.now().minusMinutes(10);
 
         List<Status> targets = List.of(Status.PENDING, Status.PROCESSING);
 
