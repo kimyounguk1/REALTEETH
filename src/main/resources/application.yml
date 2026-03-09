@@ -1,0 +1,34 @@
+spring:
+  application:
+    name: kyu
+
+  kafka:
+    # Kafka ?? ?? (EC2? ???? ???? ??? EC2 ??? ???? ??.)
+    bootstrap-servers: localhost:9092
+    producer:
+      # ???? key ??? ?? : ?? ??? ???(String)? ???? Kafka? ??
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # ???? value ??? ?? : ?? ??? ???(String)? ???? Kafka? ??
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3308/REALTEETH?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Seoul
+    username: root
+    password: "0000"
+
+  jpa:
+    database: mysql
+    database-platform: org.hibernate.dialect.MySQLDialect
+    generate-ddl: true
+    hibernate:
+      ddl-auto: update
+    show_sql: true
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+
+  threads:
+    virtual:
+      enabled: true
