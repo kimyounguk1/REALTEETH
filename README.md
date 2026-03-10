@@ -10,6 +10,7 @@
 * 독립적인 상태 관리 (Isolated State Management): 외부 API 호출(I/O) 같은 긴 작업과 DB 트랜잭션을 분리했습니다. 상태 업데이트 로직을 `TaskStatusService`로 분리하여 짧은 트랜잭션(`REQUIRES_NEW`)을 유지함으로써, 애플리케이션 내부 예외나 API 통신 실패 시에도 부모 트랜잭션에 롤백되지 않고 작업의 최종 상태가 DB에 안전하게 커밋되도록 설계했습니다.
 
 flowchart LR
+    
     Client([Client]) -- 1. 이미지 처리 요청 --> API_Server[API Server\n(Virtual Threads)]
     
     subgraph "Backend System"
