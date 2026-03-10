@@ -11,19 +11,19 @@
 
 flowchart LR
     
-    Client([Client]) -- 1. 이미지 처리 요청 --> API_Server[API Server\n(Virtual Threads)]
+    Client([Client]) -- 1. 이미지 처리 요청 --> API_Server[API Server(Virtual Threads)]
     
     subgraph "Backend System"
         API_Server -- 2. 상태 저장 (PENDING) --> DB[(Database)]
-        API_Server -- 3. 메시지 발행 (Throttling 버퍼) --> Kafka{Apache Kafka\n(Topic: image.send)}
+        API_Server -- 3. 메시지 발행 (Throttling 버퍼) --> Kafka{Apache Kafka(Topic: image.send)}
         
-        Kafka -- 4. 메시지 소비 (Backpressure) --> Consumer[Kafka Listener\n(Consumer)]
-        Consumer -- 6. 상태 업데이트\n(COMPLETED / FAILED) --> DB
+        Kafka -- 4. 메시지 소비 (Backpressure) --> Consumer[Kafka Listener(Consumer)]
+        Consumer -- 6. 상태 업데이트(COMPLETED / FAILED) --> DB
         
-        Scheduler((Recovery\nScheduler)) -. 7. 10분 주기 스캔\n(Zombie Task 정리) .-> DB
+        Scheduler((Recovery\nScheduler)) -. 7. 10분 주기 스캔(Zombie Task 정리) .-> DB
     end
 
-    API_Server -. Issue Key 발급 .-> Mock_Worker[External System\nMock Worker]
+    API_Server -. Issue Key 발급 .-> Mock_Worker[External System Mock Worker]
     Consumer -- 5. AI 이미지 처리 요청 --> Mock_Worker
     
 ---
