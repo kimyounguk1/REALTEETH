@@ -20,7 +20,7 @@ flowchart LR
         Kafka -- 4. 메시지 소비 (Backpressure) --> Consumer[Kafka Listener\n(Consumer)]
         Consumer -- 6. 상태 업데이트\n(COMPLETED / FAILED) --> DB
         
-        Scheduler((Recovery\nScheduler)) -. 7. 1시간 주기 스캔\n(Zombie Task 정리) .-> DB
+        Scheduler((Recovery\nScheduler)) -. 7. 10분 주기 스캔\n(Zombie Task 정리) .-> DB
     end
 
     API_Server -. Issue Key 발급 .-> Mock_Worker[External System\nMock Worker]
