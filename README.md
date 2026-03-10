@@ -9,6 +9,22 @@
 * Apache Kafka 기반 비동기 큐잉: 무거운 이미지 처리 요청을 API Server가 직접 동기적으로 기다리지 않고, Kafka를 통해 비동기로 위임하여 서버의 응답성을 높이고 요청 유실을 방지합니다.
 * 독립적인 상태 관리 (Isolated State Management): 외부 API 호출(I/O) 같은 긴 작업과 DB 트랜잭션을 분리했습니다. 상태 업데이트 로직을 `TaskStatusService`로 분리하여 짧은 트랜잭션(`REQUIRES_NEW`)을 유지함으로써, 애플리케이션 내부 예외나 API 통신 실패 시에도 부모 트랜잭션에 롤백되지 않고 작업의 최종 상태가 DB에 안전하게 커밋되도록 설계했습니다.
 
+flowchart LR
+    Client([Client]) -- 1. 이미지 처리 요청 --> API_Server[API Server\n(Virtual Threads)]
+    
+    subgraph "Backend System"
+        API_Server -- 2. 상태 저장 (PENDING) --> DB[(Database)]
+        API_Server -- 3. 메시지 발행 (Throttling 버퍼) --> Kafka{Apache Kafka\n(Topic: image.send)}
+        
+        Kafka -- 4. 메시지 소비 (Backpressure) --> Consumer[Kafka Listener\n(Consumer)]
+        Consumer -- 6. 상태 업데이트\n(COMPLETED / FAILED) --> DB
+        
+        Scheduler((Recovery\nScheduler)) -. 7. 1시간 주기 스캔\n(Zombie Task 정리) .-> DB
+    end
+
+    API_Server -. Issue Key 발급 .-> Mock_Worker[External System\nMock Worker]
+    Consumer -- 5. AI 이미지 처리 요청 --> Mock_Worker
+    
 ---
 
 ## 2. 상태 모델 설계 (State Machine)
