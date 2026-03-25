@@ -6,7 +6,7 @@
 ## 2. 시스템 아키텍처 및 트랜잭션 흐름
 시스템의 흐름은 아래와 같이 세 단계의 격리된 트랜잭션으로 운영됩니다.
 
-```mermaid
+```
 flowchart TD
     subgraph Client_Zone [Client Interface]
         User([사용자]) -- 1. 분석 요청 --> API[API Server]
@@ -37,6 +37,7 @@ flowchart TD
     Relay -.->|PROCESSING| Task
     Worker -.->|SUCCESS/FAILED| Task
 ```
+
 ## 3. 좀비 태스크 시나리오 및 수습 전략
 로직 실패 후 실행되는 보상 로직(Saga)이 네트워크나 DB 장애로 인해 다시 실패할 때 발생하는 4가지 고립 상황을 정의했습니다.
 
