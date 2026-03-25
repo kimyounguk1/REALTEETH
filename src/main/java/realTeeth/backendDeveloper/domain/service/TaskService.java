@@ -1,13 +1,16 @@
 package realTeeth.backendDeveloper.domain.service;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import realTeeth.backendDeveloper.domain.dto.req.ClientReq;
 import realTeeth.backendDeveloper.domain.dto.res.AiFailResDto;
 import realTeeth.backendDeveloper.domain.dto.res.AiSuccessResDto;
 import realTeeth.backendDeveloper.domain.dto.res.IssueKeyRes;
 import realTeeth.backendDeveloper.domain.dto.res.KeyErrorResDto;
+import realTeeth.backendDeveloper.domain.entity.Outbox;
 import realTeeth.backendDeveloper.domain.entity.Task;
 import realTeeth.backendDeveloper.domain.entity.type.Status;
+import realTeeth.backendDeveloper.domain.repository.OutboxJpaRepository;
 import realTeeth.backendDeveloper.domain.repository.TaskJpaRepository;
 import realTeeth.backendDeveloper.global.error.CustomException;
 import realTeeth.backendDeveloper.global.error.ErrorCode;
@@ -29,6 +32,7 @@ import org.springframework.web.servlet.View;
 
 
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
@@ -44,30 +48,45 @@ public class TaskService {
     private final ObjectMapper objectMapper;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final TaskStatusService taskStatusService;
+    private final OutboxJpaRepository outboxJpaRepository;
 
-    public void workProcess(ClientReq clientReq){
-
+    public void workProcess(ClientReq clientReq) {
         duplicateCheck(clientReq);
 
-        //새로운 요청을 받을시 task를 생성
-        Task task = makeTask(clientReq);
-        Long taskId = task.getId();
+        // 초기 Task 생성 (PENDING)
+        Task task = taskJpaRepository.save(Task.builder()
+                .email(clientReq.getEmail())
+                .imageUrl(clientReq.getImageUrl())
+                .status(Status.PENDING)
+                .build());
 
-        String issueKey;
+        try {
+            // 외부 API 호출 (Issue Key) - 트랜잭션 외부에서 실행 (커넥션 점유 방지)
+            IssueKeyRes issueKeyRes = getIssueKeyProcess(clientReq.getCandidateName(), clientReq.getEmail(), task.getId());
 
-        try{
-            //이슈키 생성
-            IssueKeyRes issueKeyRes = getIssueKeyProcess(clientReq.getCandidateName(), clientReq.getEmail(), taskId);
-            issueKey = issueKeyRes.getApiKey();
-            //이미지 처리 실행
-            sendImage(issueKey, clientReq.getImageUrl(), taskId);
+            // 상태 변경과 Outbox 저장을 하나의 트랜잭션으로 묶음 (원자성)
+            saveOutboxAndTransition(task, issueKeyRes.getApiKey());
+
         } catch (Exception e) {
-            taskStatusService.updateToFailed(taskId, e.getMessage());
+            taskStatusService.updateToFailed(task.getId(), "초기화 실패: " + e.getMessage());
             throw e;
         }
+    }
 
+    @Transactional
+    public void saveOutboxAndTransition(Task task, String apiKey) {
+        //상태 변경과 메시지 요청을 하나로 묶음(outbox)
+        //우리 DB의 상태와 kafka의 상태가 항상 일치
+        taskStatusService.updateStatus(task.getId(), Status.PROCESSING);
 
-
+        outboxJpaRepository.save(Outbox.builder()
+                .topic("image.send")
+                .payload(task.getImageUrl())
+                .apiKey(apiKey)
+                .taskId(task.getId())
+                .processed(false)
+                .createdAt(LocalDateTime.now())
+                .build());
     }
 
     private void duplicateCheck(ClientReq clientReq) {
@@ -114,51 +133,28 @@ public class TaskService {
 
     }
 
-    @KafkaListener(
-            topics = "image.send",
-            groupId = "image-send-group"
-    )
-    //상태의 명확성을 위해 재시도 하지 않음.
-    //ai 서버로 확실히 요청을 보냈는지는 알 수 없는 지점이 있음, ai서버에 요청이 갔는지 안갔는지 확인 할 수 있는 수단이 없음.
-    public void kafkaListener (@Payload String imageUrl, @Header("X-API-KEY") String key, @Header("TASK-ID") String taskId) {
-
+    @KafkaListener(topics = "image.send", groupId = "image-send-group")
+    public void kafkaListener(@Payload String imageUrl, @Header("X-API-KEY") String key, @Header("TASK-ID") String taskId) {
         Long longTaskId = Long.parseLong(taskId);
-        log.info("이미지 처리 요청 시작 : {}", imageUrl);
-        log.info("가상 스레드 여부 : {}", Thread.currentThread().isVirtual());
-        try{
-            AiSuccessResDto aiResponse = restClient.post()
+
+        try {
+            AiSuccessResDto res = restClient.post()
                     .uri("https://dev.realteeth.ai/mock/process")
                     .header("X-API-KEY", key)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(Map.of("imageUrl", imageUrl))
                     .retrieve()
-                    .onStatus(HttpStatusCode::isError, (req,res)->{
-                        AiFailResDto errorBody = objectMapper.readValue(res.getBody(), AiFailResDto.class);
-                        log.error("AI API 호출 도중 HTTP 에러 발생 : {}, 에러 원문 : {}", res.getStatusCode(), errorBody.detail());
-                        //외부 AI 서버 예외 통일, 자세한 사항은 message로 식별
-                        throw new CustomException(ErrorCode.AI_PROCESS_FAIL, errorBody.detail().toString());
+                    .onStatus(HttpStatusCode::isError, (req, response) -> {
+                        throw new CustomException(ErrorCode.AI_PROCESS_FAIL, "AI 서버 응답 에러");
                     })
                     .body(AiSuccessResDto.class);
-            taskStatusService.updateToAiReqSuccess(longTaskId, aiResponse.jobId());
 
-            log.info("이미지 분석 요청 성공 : jobID={}, status={}", aiResponse.jobId(), aiResponse.status());
-        }catch (CustomException e){
+            // 성공 시 상태 업데이트
+            taskStatusService.updateToAiReqSuccess(longTaskId, res.jobId());
+        } catch (Exception e) {
+            // [Saga 보상 로직] 명시적 실패 시 DB 상태를 즉시 FAILED로 변경
+            log.error("AI 처리 중 에러 발생, 상태를 FAILED로 변경합니다. TaskID: {}", longTaskId);
             taskStatusService.updateToFailed(longTaskId, e.getMessage());
-        }catch (Exception e){
-            taskStatusService.updateToFailed(longTaskId, e.getMessage());
-            // 네트워크 타임아웃, 커넥션 거부 등 "기술적 장애" 처리
-            Throwable cause = (e instanceof ResourceAccessException) ? e.getCause() : e;
-
-            if (cause instanceof java.net.http.HttpTimeoutException) {
-                log.error("이미지 분석 요청 타임아웃 발생", e);
-            }
-
-            if (cause instanceof java.net.ConnectException || e instanceof ResourceAccessException) {
-                log.error("AI 서버 연결 실패", e);
-            }
-
-            // 그 외 예상치 못한 내부 런타임 에러
-            log.error("이미지 분석 요청 중 알 수 없는 예외 발생", e);
         }
     }
 
