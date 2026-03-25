@@ -1,78 +1,82 @@
-# REALTEETH
+REALTEETH: Transactional Outbox 기반 비동기 이미지 처리 시스템
+1. 설계 의도: 예외 상황의 완전 통제
+외부 AI 서비스와 연동하는 비동기 시스템에서 가장 위험한 것은 데이터 유실이나 무한 대기가 아닙니다. 바로 보상 로직(Saga)조차 실패하여 장부가 꼬이는 좀비 태스크입니다. 본 프로젝트는 발생 가능한 모든 실패 지점을 정의하고, 이를 자가 치유(Self-healing)할 수 있는 구조를 설계하는 데 집중했습니다.
 
-# 비동기 이미지 처리 시스템 설계
+2. 시스템 아키텍처 및 트랜잭션 흐름
+시스템의 흐름은 아래와 같이 세 단계의 격리된 트랜잭션으로 운영됩니다.
 
-## 1. 과제 개요 및 핵심 설계 의도
-본 과제는 '불확실성이 높은 외부 AI 서비스(Mock Worker)와의 연동 시, 시스템의 안정성과 데이터 정합성을 어떻게 유지할 것인가?'에 대한 고민을 바탕으로 설계되었습니다. 대량의 트래픽과 외부 서버의 지연/장애 상황에서도 시스템이 예측 가능하고 내구성 있게 동작하도록 다음의 핵심 기술을 도입했습니다.
+코드 스니펫
 
-* Java 21 Virtual Threads: I/O 바운드 작업(외부 API 호출 및 대기)이 주를 이루는 시스템 특성상, 가상 스레드를 활용해 적은 리소스로 높은 동시 처리량을 확보했습니다.
-* Apache Kafka 기반 비동기 큐잉: 무거운 이미지 처리 요청을 API Server가 직접 동기적으로 기다리지 않고, Kafka를 통해 비동기로 위임하여 서버의 응답성을 높이고 요청 유실을 방지합니다.
-* 독립적인 상태 관리 (Isolated State Management): 외부 API 호출(I/O) 같은 긴 작업과 DB 트랜잭션을 분리했습니다. 상태 업데이트 로직을 `TaskStatusService`로 분리하여 짧은 트랜잭션(`REQUIRES_NEW`)을 유지함으로써, 애플리케이션 내부 예외나 API 통신 실패 시에도 부모 트랜잭션에 롤백되지 않고 작업의 최종 상태가 DB에 안전하게 커밋되도록 설계했습니다.
-
-flowchart LR
-    
-    Client([Client]) -- 1. 이미지 처리 요청 --> API_Server[API Server(Virtual Threads)]
-    
-    subgraph "Backend System"
-        API_Server -- 2. 상태 저장 (PENDING) --> DB[(Database)]
-        API_Server -- 3. 메시지 발행 (Throttling 버퍼) --> Kafka{Apache Kafka(Topic: image.send)}
-        
-        Kafka -- 4. 메시지 소비 (Backpressure) --> Consumer[Kafka Listener(Consumer)]
-        Consumer -- 6. 상태 업데이트(COMPLETED / FAILED) --> DB
-        
-        Scheduler((Recovery\nScheduler)) -. 7. 10분 주기 스캔(Zombie Task 정리) .-> DB
+flowchart TD
+    subgraph Client_Zone [Client Interface]
+        User([사용자]) -- 1. 분석 요청 --> API[API Server]
     end
 
-    API_Server -. Issue Key 발급 .-> Mock_Worker[External System Mock Worker]
-    Consumer -- 5. AI 이미지 처리 요청 --> Mock_Worker
-    
----
+    subgraph DB_Zone [Persistence Layer]
+        Task[(Task Table)]
+        Outbox[(Outbox Table)]
+    end
 
-## 2. 상태 모델 설계 (State Machine)
-작업의 생명주기를 4단계로 정의하여 불확실성을 통제합니다.
+    subgraph Relay_Zone [Message Relay]
+        Relay[[Outbox Relay Scheduler]]
+        Relay -- "2. Pre-marking (REQUIRES_NEW)" --> DB_Zone
+        Relay -- "3. Synchronous Send (get)" --> Kafka{Kafka Topic}
+    end
 
-* `PENDING` (백엔드 서버 처리 대기중): 클라이언트 요청이 접수되어 DB에 초기 저장된 상태.
-* `PROCESSING` (API-KEY 발급 완료): 인증 키가 발급되고, Kafka로 메시지가 발행되어 AI 서버로 요청이 진행 중인 상태.
-* `COMPLETED` (AI 서버에 요청 완료): 외부 서버(Mock Worker)로부터 정상적으로 `jobId`를 발급받은 최종 성공 상태.
-* `FAILED` (실패): 네트워크 타임아웃, 커넥션 거부, 시스템 내부 오류, 혹은 장기 미처리(좀비 상태)로 인한 작업 실패 상태.
+    subgraph Execution_Zone [AI Processing]
+        Kafka -- 4. Consume --> Worker[Kafka Listener]
+        Worker -- 5. External API Call --> AI[AI Mock Worker]
+        Worker -- 6. State Update --> Task
+    end
 
-[상태 전이 흐름 및 제한]
-* 정상 흐름: `PENDING` ➔ `PROCESSING` ➔ `COMPLETED`
-* 실패 흐름: `PENDING` ➔ `FAILED` 또는 `PROCESSING` ➔ `FAILED`
-* 제한: 한 번 종료된 상태(`COMPLETED`, `FAILED`)에서 다른 상태로의 전이는 허용하지 않으며, 처리 과정의 명확성을 위해 외부 API 호출 실패 시 섣부른 재시도를 하지 않고 즉시 `FAILED` 처리합니다.
+    subgraph Recovery_Zone [Self Healing]
+        RS[[Recovery Scheduler]] -- "7. Zombie Scan (10m)" --> Task
+    end
 
----
+    %% 상태 변화 강조
+    API -.->|PENDING| Task
+    Relay -.->|PROCESSING| Task
+    Worker -.->|SUCCESS/FAILED| Task
+3. 좀비 태스크 시나리오 및 수습 전략
+로직 실패 후 실행되는 보상 로직(Saga)이 네트워크나 DB 장애로 인해 다시 실패할 때 발생하는 4가지 고립 상황을 정의했습니다.
 
-## 3. 주요 요구사항 해결 방식
+시나리오 1: 초기 저장 단계의 고립 (PENDING 좀비)
+상황: Task(PENDING) 저장 직후 Outbox 저장 실패 및 보상 로직 실패.
 
-### 3.1 처리 보장 모델 (Delivery Semantics)
-본 시스템은 외부 AI 서버 연동에 있어 [최대 한 번 전달 (At-Most-Once)] 모델을 기반으로 한 명시적 실패(Fail-Fast) 전략을 채택했습니다.
-* 판단 근거: AI 이미지 처리는 GPU 리소스를 크게 소모하는 무거운 작업입니다. 만약 네트워크 타임아웃 시 시스템이 자동으로 재시도(Retry)를 수행한다면, 실제로는 AI 서버가 작업을 수행 중임에도 불구하고 동일한 요청이 중복으로 전달되어 외부 시스템에 치명적인 부하를 유발할 수 있습니다.
-* 해결 방식: 카프카 컨슈머에서 타임아웃 등 예외가 발생하더라도 재처리하지 않고 해당 작업을 즉시 `FAILED` 상태로 마킹합니다. 불확실한 재시도보다 클라이언트에게 명확한 실패를 알리는 것이 시스템 전체의 안정성을 위해 적합하다고 판단했습니다.
+결과: 발송 대기 상태로 DB에 남았으나 발송 장부(Outbox)가 없어 영원히 방치됨.
 
-### 3.2 중복 요청 및 동시성 제어
-* 동일한 클라이언트(email)가 동일한 이미지(imageUrl)를 중복해서 요청하는 것을 방지하기 위해 `duplicateCheck` 로직을 도입했습니다.
-* 현재 진행 중인 작업(`PENDING`, `PROCESSING` 상태)이 존재할 경우 `CustomException(DUPLICATE_REQUEST)`을 발생시켜 불필요한 리소스 낭비와 외부 API 중복 호출을 원천 차단합니다.
+수습: Recovery Scheduler가 생성 후 10분이 지난 PENDING 작업을 탐지하여 강제 실패 처리.
 
-### 3.3 서버 재시작 시 동작 및 데이터 정합성 보장
-* Kafka를 통한 요청 유실 방지: 어플리케이션 서버가 예기치 않게 종료되더라도, Kafka 큐에 발행된 메시지는 컨슈머가 정상 처리를 완료(Offset Commit)하기 전까지 브로커에 안전하게 영속화됩니다. 따라서 서버 재시작 시 Kafka Consumer가 이어서 메시지를 소비하므로 요청 자체의 소실을 막을 수 있습니다.
-* 상태 고립(Zombie Task) 해결: 처리 도중 서버가 종료되어 가상 스레드 메모리 작업은 중단되었으나 DB에는 `PROCESSING` 상태로 고립된 데이터가 발생할 수 있습니다. 이를 복구하기 위해 `TaskRecoveryScheduler`가 동작합니다. 생성된 지 10분 이상(`minusMinutes(10)` 기준) 지났음에도 완료되지 않은 작업들을 주기적으로 스캔하여 일괄적으로 `FAILED` 처리함으로써 데이터 정합성을 일관되게 복구합니다. (상태 및 생성 시간 인덱싱 처리를 통해 조회 성능 향상 고려)
+시나리오 2: 발송 단계의 고립 (PROCESSING 좀비)
+상황: markAsAttempted(PROCESSING) 성공 후 Kafka 전송 실패 및 보상 로직 실패.
 
-### 3.4 트래픽 증가 시 병목 가능 지점 및 시스템 보호 전략
-* 병목 현상 (Consumer Lag): 가상 스레드를 활용한 API 서버의 요청 수용 속도(Producer)가 AI 서버의 처리 속도(Consumer)를 압도할 경우, Kafka 브로커 자체가 다운되지는 않으나 큐에 메시지가 누적되는 Consumer Lag(컨슈머 랙) 증가에 따른 논리적 병목(클라이언트의 무한 대기) 현상이 발생할 수 있습니다.
-* 대응 및 보호 아키텍처: 
-  1. 기본적으로 Kafka를 Throttling 버퍼로 활용하여 외부 AI 서버로 향하는 초당 요청수(RPS)를 제어(Backpressure)합니다.
-  2. [향후 운영 개선] Spring Boot Actuator/Micrometer 또는 Kafka Exporter를 통해 Consumer Lag 지표를 Prometheus와 Grafana로 모니터링합니다. Lag이 시스템 허용 임계치를 초과할 경우, API 앞단(Gateway 또는 Interceptor)에서 신규 요청을 `429 Too Many Requests`로 선제 차단(Rate Limiting)하여 큐의 마비와 시스템 연쇄 장애를 방어하는 아키텍처를 고려했습니다.
+결과: 장부에는 전송됨으로 기록되어 Relay가 다시 잡지 않으며, 실질적으로는 메시지가 유실되어 PROCESSING 상태로 고립됨.
 
----
+수습: Recovery Scheduler가 수정 후 10분이 지난 PROCESSING 작업을 탐지하여 강제 실패 처리.
 
-## 4. 한계점 및 향후 개선 제안 (Future Improvements)
-현재의 아키텍처에서 한 단계 더 나아간 실제 운영 환경이라면 다음과 같은 개선을 제안합니다.
+시나리오 3 & 4: 응답 반영 단계의 고립 (PROCESSING 좀비)
+상황: AI 서버 작업이 성공 혹은 실패했으나, 그 결과를 DB에 업데이트하는 과정에서 장애 발생.
 
-1. 멱등성 키(Idempotency Key) 협의: 현재의 '최대 한 번 전달' 제약을 극복하기 위해, 외부 서버 API 스펙에 멱등성 키 헤더를 추가하도록 협의할 수 있습니다. 이를 통해 네트워크 단절 시에도 외부 서버에서 알아서 중복 처리를 방지해 주므로 안전하게 재시도(Retry)를 수행할 수 있습니다.
-2. 콜백(Webhook) 기반 비동기 아키텍처: 현재 클라이언트가 작업 상태를 확인하기 위해 지속적으로 폴링(Polling)을 해야 합니다. AI 서버의 작업이 수십 초 이상 걸릴 수 있으므로, 완료 시점에 외부 서버가 우리 서버의 특정 엔드포인트(Webhook)로 결과를 전달해 주는 이벤트 기반 구조로 개선하면 서버와 네트워크 리소스를 훨씬 더 효율적으로 사용할 수 있습니다.
+결과: 외부 작업은 종료되었으나 우리 서버의 장부상으로는 여전히 분석 중(PROCESSING)으로 고립됨.
 
----
+수습: Recovery Scheduler가 수정 후 10분이 지난 PROCESSING 작업을 탐지하여 강제 실패 처리.
+
+4. 핵심 기술적 장치
+4.1 REQUIRES_NEW를 이용한 Pre-marking
+Outbox Relay는 Kafka에 메시지를 쏘기 전, 반드시 별도의 독립 트랜잭션을 열어 DB에 전송 시작 도장을 찍습니다.
+
+이유: 전송 후 상태를 바꾸면, 전송 성공 직후 서버가 죽었을 때 재시작 시 중복 메시지가 발행될 위험이 있습니다.
+
+해결: 먼저 장부에 전송 중임을 확정(Commit) 지음으로써 중복 발송 가능성을 100% 차단합니다.
+
+4.2 동기식 전송 확인 (Sync Send)
+kafkaTemplate.send().get()을 사용하여 브로커가 메시지를 확실히 수신했는지 확인합니다. 비동기 전송의 함정인 전송 결과 누락을 방지하고, 실패 시 즉시 catch 블록을 통해 보상 로직을 가동합니다.
+
+4.3 가상 스레드(Virtual Threads) 기반 I/O 처리
+Java 21의 가상 스레드를 활용하여 Outbox Relay의 DB 조회 및 Kafka 전송, Listener의 외부 API 호출 시 발생하는 블로킹 타임을 최소한의 리소스로 소화합니다.
+
+5. 설계 결론: 명확한 실패(Fail-Fast)
+모호한 재시도(Retry)는 시스템 부하와 데이터 복잡도를 가중시킵니다. 본 설계는 실패를 처리하는 로직조차 실패한다면, 이를 억지로 다시 실행하기보다 타임아웃 기반의 스케줄러를 통해 상황을 조기에 종결시키는 Fail-Fast 전략을 택했습니다. 이를 통해 사용자는 10분 이내에 확정된 실패 응답을 받고 재요청할 수 있는 상태를 보장받습니다.
 
 ## 5. 실행 방법 (How to Run)
 
