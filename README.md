@@ -6,7 +6,7 @@
 ## 2. 시스템 아키텍처 및 트랜잭션 흐름
 시스템의 흐름은 아래와 같이 세 단계의 격리된 트랜잭션으로 운영됩니다.
 
-```
+```mermaid
 flowchart TD
     subgraph Client_Zone [Client Interface]
         User([사용자]) -- 1. 분석 요청 --> API[API Server]
